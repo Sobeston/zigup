@@ -1,6 +1,5 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const fixdeletetree = @import("fixdeletetree.zig");
 
 const help =
     \\Download and manage zig compilers.
@@ -87,13 +86,16 @@ const Command = enum {
                 break @enumFromInt(i);
             }
         } else cmd: {
-            if (argv.len > 1) break :cmd .none;
+            if (argv.len == 1) break :cmd .none;
 
             try std.io.getStdOut().writeAll(help);
             return error.AlreadyReported;
         };
 
-        try checkRequired(command, argv[1..]);
+        try checkRequired(
+            command,
+            if (command == .none) argv else argv[1..],
+        );
 
         return command;
     }
@@ -134,7 +136,7 @@ const defaults = struct {
         allocator: std.mem.Allocator,
     ) ![]const u8 {
         return switch (builtin.os.tag) {
-            else => @panic("unimpl"),
+            else => @panic("unimplemented"),
             .linux, .macos => default_path: {
                 const home = std.posix.getenv("HOME") orelse {
                     std.log.err("$HOME environment variable is not set.", .{});
@@ -149,6 +151,16 @@ const defaults = struct {
                 break :default_path try std.fs.path.join(allocator, &.{ home, "zig" });
             },
         };
+    }
+
+    fn zigPathLink(
+        allocator: std.mem.Allocator,
+        install_path: []const u8,
+    ) ![]const u8 {
+        return try std.fs.path.join(
+            allocator,
+            &.{ install_path, "zig" ++ comptime builtin.target.exeFileExt() },
+        );
     }
 };
 
@@ -181,33 +193,46 @@ pub fn mainInner() !void {
         return error.AlreadyReported;
     }
 
-    var did_allocate_path: bool = false;
+    var allocated_install_path: bool = false;
     const install_dir_path: []const u8 = Option.install_dir.getArg(argv) orelse from_env: {
         if (builtin.os.tag == .windows) break :from_env null;
         break :from_env std.posix.getenv("ZIGUP_INSTALL_DIR");
     } orelse allocated: {
         const path = try defaults.installPath(allocator);
-        did_allocate_path = true;
+        allocated_install_path = true;
         break :allocated path;
     };
-    defer if (did_allocate_path) allocator.free(install_dir_path);
+    defer if (allocated_install_path) allocator.free(install_dir_path);
+
+    var allocated_link_path: bool = false;
+    const path_link = Option.path_link.getArg(argv) orelse allocated: {
+        allocated_link_path = true;
+        break :allocated try defaults.zigPathLink(allocator, install_dir_path);
+    };
+    defer if (allocated_link_path) allocator.free(path_link);
 
     const index_url = Option.index.getArg(argv) orelse defaults.index_url;
 
     const command = try Command.fromArgv(argv);
     switch (command) {
         .list => {
-            const install_dir = try std.fs.openDirAbsolute(install_dir_path, .{ .iterate = true });
+            var install_dir = try std.fs.openDirAbsolute(install_dir_path, .{ .iterate = true });
+            defer install_dir.close();
+
             try listCompilers(install_dir);
         },
         .keep => {
             const version = argv[1];
-            const install_dir = try std.fs.openDirAbsolute(install_dir_path, .{ .iterate = true });
+
+            var install_dir = try std.fs.openDirAbsolute(install_dir_path, .{ .iterate = true });
+            defer install_dir.close();
+
             try keepCompiler(version, install_dir);
         },
         .run => {
             const version = argv[1];
             const compiler_args = argv[2..];
+
             const exit_code = try runCompiler(allocator, install_dir_path, version, compiler_args);
             if (exit_code != 0) std.log.info("compiler exited with code: {}.", .{exit_code});
         },
@@ -218,26 +243,212 @@ pub fn mainInner() !void {
         .fetch => {
             const version = argv[1];
 
-            const install_dir = try std.fs.openDirAbsolute(install_dir_path, .{ .iterate = true });
-            const version_url = try resolveVersionUrl(allocator, version, index_url);
-            defer version_url.deinit(allocator);
+            var install_dir = try std.fs.openDirAbsolute(install_dir_path, .{ .iterate = true });
+            defer install_dir.close();
 
-            errdefer std.log.err("Failed to install version: {s}", .{version_url.version});
-
-            try install_dir.makeDir(version_url.version); // TODO catch existing
-            const version_dir = try install_dir.openDir(version_url.version, .{ .iterate = true });
-
-            const is_empty = blk: {
-                var iter = version_dir.iterate();
-                while (try iter.next()) |_| break :blk false;
-                break :blk true;
-            };
-            if (!is_empty) std.log.err("version {s} already installed.", .{version_url.version});
-
-            try installFromURL(allocator, version_url.url, version_dir);
+            const resolved_version = try installVersion(allocator, install_dir, version, index_url);
+            defer resolved_version.deinit(allocator);
         },
-        .none, .default, .clean => @panic("unimplemented"),
+        .default => {
+            var install_dir = try std.fs.openDirAbsolute(install_dir_path, .{ .iterate = true });
+            defer install_dir.close();
+
+            if (argv.len == 1) {
+                errdefer std.log.err("Failed to get as default compiler path.", .{});
+
+                std.log.info("zig symlink at: {s}", .{path_link});
+
+                const default_compiler_path = try getDefaultCompilerPath(allocator, path_link);
+                defer if (default_compiler_path) |path| allocator.free(path);
+
+                try std.io.getStdOut().writer().print(
+                    "zig default compiler at: {s}\n",
+                    .{default_compiler_path orelse "<nothing?>"},
+                );
+            } else {
+                const version = argv[1];
+
+                try setDefault(allocator, install_dir, path_link, version);
+            }
+        },
+        .none => {
+            const version = argv[0];
+
+            var install_dir = try std.fs.openDirAbsolute(install_dir_path, .{ .iterate = true });
+            defer install_dir.close();
+
+            var dir = install_dir.openDir(version, .{}) catch |err| switch (err) {
+                else => return err,
+                error.FileNotFound => {
+                    std.log.info("version {s} not found, fetching", .{version});
+
+                    const resolved_version = try installVersion(
+                        allocator,
+                        install_dir,
+                        version,
+                        index_url,
+                    );
+                    defer resolved_version.deinit(allocator);
+
+                    try setDefault(allocator, install_dir, path_link, resolved_version.version);
+
+                    return; // TODO - not great?
+                },
+            };
+            dir.close();
+
+            std.log.info("version {s} already exists, setting as default", .{version});
+
+            try setDefault(allocator, install_dir, path_link, version);
+        },
+        .clean => {
+            const clean_mode = if (argv.len == 2)
+                CleanMode{ .version = argv[1] }
+            else
+                CleanMode.all;
+
+            var install_dir = try std.fs.openDirAbsolute(install_dir_path, .{ .iterate = true });
+            defer install_dir.close();
+
+            try cleanCompilers(allocator, install_dir, clean_mode, path_link);
+        },
     }
+}
+
+const ResolvedVersion = struct {
+    allocated: bool,
+    version: []const u8,
+    fn deinit(self: ResolvedVersion, allocator: std.mem.Allocator) void {
+        if (self.allocated) allocator.free(self.version);
+    }
+};
+
+fn installVersion(allocator: std.mem.Allocator, install_dir: std.fs.Dir, version: []const u8, index_url: []const u8) !ResolvedVersion {
+    const version_url = try resolveVersionUrl(allocator, version, index_url);
+    defer allocator.free(version_url.url);
+    errdefer allocator.free(version_url.version);
+
+    errdefer std.log.err("Failed to install version: {s}", .{version_url.version});
+
+    const version_dir = makeNewVersionDir(install_dir, version_url.version) catch |err| switch (err) {
+        error.PathAlreadyExists => {
+            std.log.info("found version: {s}, which is already installed", .{version_url.version});
+            return ResolvedVersion{ .allocated = true, .version = version_url.version };
+        },
+        else => return err,
+    };
+
+    errdefer install_dir.deleteDir(version_url.version) catch {
+        std.log.err("failed to delete version folder: {s}", .{version_url.version});
+    };
+
+    try installFromURL(allocator, version_url.url, version_dir);
+
+    return ResolvedVersion{ .allocated = true, .version = version_url.version };
+}
+
+/// fails if version does not exist
+fn setDefault(
+    allocator: std.mem.Allocator,
+    install_dir: std.fs.Dir,
+    path_link: []const u8,
+    version: []const u8,
+) !void {
+    errdefer std.log.err("Failed to set {s} as default.", .{version});
+
+    const default_compiler_path = try getDefaultCompilerPath(allocator, path_link);
+    defer if (default_compiler_path) |path| allocator.free(path);
+
+    if (default_compiler_path) |path| {
+        if (std.mem.endsWith(u8, path, version)) {
+            std.log.err("Version already default: {s}", .{version});
+            return error.AlreadyReported;
+        }
+    }
+
+    errdefer std.log.err("Error replacing symlink", .{});
+
+    var version_dir = try install_dir.openDir(version, .{});
+    defer version_dir.close();
+
+    var files_dir = try version_dir.openDir("files", .{});
+    defer files_dir.close();
+
+    std.log.info("replacing symlink", .{});
+
+    const versioned_binary_path = try std.fs.path.join(allocator, &.{
+        version,
+        "files",
+        "zig" ++ comptime builtin.target.exeFileExt(),
+    });
+    defer allocator.free(versioned_binary_path);
+
+    try install_dir.deleteFile("zig");
+
+    switch (builtin.os.tag) {
+        else => {
+            try std.posix.symlinkat(
+                versioned_binary_path,
+                install_dir.fd,
+                "zig",
+            );
+        },
+    }
+}
+
+const CleanMode = union(enum) { all, version: []const u8 };
+
+fn cleanCompilers(
+    allocator: std.mem.Allocator,
+    install_dir: std.fs.Dir,
+    mode: CleanMode,
+    path_link: []const u8,
+) !void {
+    const default_compiler_path = try getDefaultCompilerPath(allocator, path_link);
+    defer if (default_compiler_path) |path| allocator.free(path);
+
+    _ = install_dir;
+    _ = mode;
+
+    @panic("unimplemented");
+}
+
+fn shouldSkipClean(version: []const u8) bool {
+    _ = version;
+    return false; // TODO
+}
+
+fn getDefaultCompilerPath(
+    allocator: std.mem.Allocator,
+    path_link: []const u8,
+) !?[]const u8 {
+    var buffer: [std.fs.MAX_PATH_BYTES]u8 = undefined;
+    const target_path: []u8 = std.fs.readLinkAbsolute(path_link, &buffer) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+
+    return try allocator.dupe(u8, target_path);
+}
+
+fn makeNewVersionDir(install_dir: std.fs.Dir, version: []const u8) !std.fs.Dir {
+    try install_dir.makeDir(version);
+    const version_dir = try install_dir.openDir(version, .{ .iterate = true });
+    errdefer install_dir.deleteDir(version) catch {
+        std.log.err("failed to delete version folder: {s}", .{version});
+    };
+
+    const is_empty = blk: {
+        var iter = version_dir.iterate();
+        while (try iter.next()) |_| break :blk false;
+        break :blk true;
+    };
+    if (!is_empty) {
+        std.log.err("version {s} already installed.", .{version});
+        return error.AlreadyReported;
+    }
+
+    return version_dir;
 }
 
 fn getDefaultUrl(allocator: std.mem.Allocator, version: []const u8) ![]const u8 {
@@ -341,8 +552,17 @@ fn installFromURL(
             const folder_name = archive_name[0 .. archive_name.len - ".tar.xz".len];
             try std.fs.Dir.rename(version_dir, folder_name, "files");
         },
-        .zip => @panic("todo"),
+        .zip => {
+            var stream = archive_file.seekableStream();
+
+            // TODO this is probably slow?
+            try std.zip.extract(version_dir, &stream, .{});
+            const folder_name = archive_name[0 .. archive_name.len - ".zip".len];
+            try std.fs.Dir.rename(version_dir, folder_name, "files");
+        },
     }
+
+    // TODO: update master symlink
 }
 
 fn download(allocator: std.mem.Allocator, url: []const u8, writer: anytype) !void {
