@@ -21,10 +21,10 @@ const help =
     \\
     \\Common Options:
     \\  --install-dir DIR             override the default install location
+    \\  --index URL                   override the default index URL
     \\  --path-link PATH              path to the `zig` symlink that points to the default compiler
     \\                                this will typically be a file path within a PATH directory so
     \\                                that the user can just run `zig`
-    \\
 ;
 
 const Command = enum {
@@ -108,24 +108,80 @@ const Option = enum {
 
     const enum_len = @typeInfo(Option).Enum.fields.len;
 
-    // TODO: should these all have env var equivalents?
-    const enum_strings: [enum_len][]const u8 = .{
+    const argv_strings: [enum_len][]const u8 = .{
         "--install-dir",
         "--path-link",
         "--index",
     };
 
-    fn string(self: Option) []const u8 {
-        return enum_strings[@intFromEnum(self)];
+    const env_var_strings: [enum_len][]const u8 = .{
+        "ZIGUP_INSTALL_DIR",
+        "ZIGUP_PATH_LINK",
+        "ZIGUP_INDEX",
+    };
+
+    const static_defaults: [enum_len]?[]const u8 = .{ null, null, defaults.index_url };
+
+    fn argvString(self: Option) []const u8 {
+        return argv_strings[@intFromEnum(self)];
     }
 
-    fn getArg(self: Option, argv: []const []const u8) ?[]const u8 {
+    fn envVarString(self: Option) []const u8 {
+        return env_var_strings[@intFromEnum(self)];
+    }
+
+    fn defaultStatic(self: Option) ?[]const u8 {
+        return static_defaults[@intFromEnum(self)];
+    }
+
+    const FoundValue = struct {
+        const From = enum { argv, env_var, default_static, default_dynamic };
+        value: []const u8,
+        from: From,
+        fn deinit(self: FoundValue, allocator: std.mem.Allocator) void {
+            if (self.from == .env_var or self.from == .default_dynamic) allocator.free(self.value);
+        }
+    };
+
+    const FallBackError = error{ OutOfMemory, AlreadyReported };
+
+    fn getArg(
+        self: Option,
+        allocator: std.mem.Allocator,
+        argv: []const []const u8,
+        context: anytype,
+        fallback_fn: ?*const fn (std.mem.Allocator, @TypeOf(context)) FallBackError![]const u8,
+    ) !FoundValue {
+        if (self.defaultStatic() == null and fallback_fn == null)
+            unreachable;
+
         for (0.., argv) |i, arg| {
-            if (std.mem.eql(u8, arg, self.string())) {
-                if (argv.len >= i + 1) return argv[i + 1];
+            if (std.mem.eql(u8, arg, self.argvString())) {
+                if (argv.len >= i + 1) {
+                    return FoundValue{ .value = argv[i + 1], .from = .argv };
+                }
             }
         }
-        return null;
+
+        if (std.process.getEnvVarOwned(allocator, self.envVarString()) catch |err| switch (err) {
+            error.EnvironmentVariableNotFound => null,
+            else => return err,
+        }) |v| {
+            return FoundValue{ .value = v, .from = .env_var };
+        }
+
+        if (self.defaultStatic()) |v| {
+            return FoundValue{ .value = v, .from = .default_static };
+        }
+
+        if (fallback_fn) |fallback| {
+            return FoundValue{
+                .value = try fallback(allocator, context),
+                .from = .default_dynamic,
+            };
+        }
+
+        unreachable;
     }
 };
 
@@ -134,7 +190,10 @@ const defaults = struct {
 
     fn installPath(
         allocator: std.mem.Allocator,
-    ) ![]const u8 {
+        context: void,
+    ) Option.FallBackError![]const u8 {
+        _ = context;
+
         return switch (builtin.os.tag) {
             else => @panic("unimplemented"),
             .linux, .macos => default_path: {
@@ -156,7 +215,7 @@ const defaults = struct {
     fn zigPathLink(
         allocator: std.mem.Allocator,
         install_path: []const u8,
-    ) ![]const u8 {
+    ) Option.FallBackError![]const u8 {
         return try std.fs.path.join(
             allocator,
             &.{ install_path, "zig" ++ comptime builtin.target.exeFileExt() },
@@ -193,30 +252,29 @@ pub fn mainInner() !void {
         return error.AlreadyReported;
     }
 
-    var allocated_install_path: bool = false;
-    const install_dir_path: []const u8 = Option.install_dir.getArg(argv) orelse from_env: {
-        if (builtin.os.tag == .windows) break :from_env null;
-        break :from_env std.posix.getenv("ZIGUP_INSTALL_DIR");
-    } orelse allocated: {
-        const path = try defaults.installPath(allocator);
-        allocated_install_path = true;
-        break :allocated path;
-    };
-    defer if (allocated_install_path) allocator.free(install_dir_path);
+    const install_dir_path = try Option.install_dir.getArg(
+        allocator,
+        argv,
+        {},
+        defaults.installPath,
+    );
+    defer install_dir_path.deinit(allocator);
 
-    var allocated_link_path: bool = false;
-    const path_link = Option.path_link.getArg(argv) orelse allocated: {
-        allocated_link_path = true;
-        break :allocated try defaults.zigPathLink(allocator, install_dir_path);
-    };
-    defer if (allocated_link_path) allocator.free(path_link);
+    const path_link = try Option.path_link.getArg(
+        allocator,
+        argv,
+        install_dir_path.value,
+        defaults.zigPathLink,
+    );
+    defer path_link.deinit(allocator);
 
-    const index_url = Option.index.getArg(argv) orelse defaults.index_url;
+    const index_url = try Option.index.getArg(allocator, argv, {}, null);
+    defer index_url.deinit(allocator);
 
     const command = try Command.fromArgv(argv);
     switch (command) {
         .list => {
-            var install_dir = try std.fs.openDirAbsolute(install_dir_path, .{ .iterate = true });
+            var install_dir = try std.fs.openDirAbsolute(install_dir_path.value, .{ .iterate = true });
             defer install_dir.close();
 
             try listCompilers(install_dir);
@@ -224,7 +282,7 @@ pub fn mainInner() !void {
         .keep => {
             const version = argv[1];
 
-            var install_dir = try std.fs.openDirAbsolute(install_dir_path, .{ .iterate = true });
+            var install_dir = try std.fs.openDirAbsolute(install_dir_path.value, .{ .iterate = true });
             defer install_dir.close();
 
             try keepCompiler(version, install_dir);
@@ -233,32 +291,32 @@ pub fn mainInner() !void {
             const version = argv[1];
             const compiler_args = argv[2..];
 
-            const exit_code = try runCompiler(allocator, install_dir_path, version, compiler_args);
+            const exit_code = try runCompiler(allocator, install_dir_path.value, version, compiler_args);
             if (exit_code != 0) std.log.info("compiler exited with code: {}.", .{exit_code});
         },
         .fetch_index => {
-            const index_string = try downloadIndex(allocator, index_url);
+            const index_string = try downloadIndex(allocator, index_url.value);
             try std.io.getStdOut().writeAll(index_string);
         },
         .fetch => {
             const version = argv[1];
 
-            var install_dir = try std.fs.openDirAbsolute(install_dir_path, .{ .iterate = true });
+            var install_dir = try std.fs.openDirAbsolute(install_dir_path.value, .{ .iterate = true });
             defer install_dir.close();
 
-            const resolved_version = try installVersion(allocator, install_dir, version, index_url);
-            defer resolved_version.deinit(allocator);
+            const resolved_version = try installVersion(allocator, install_dir, version, index_url.value);
+            defer allocator.free(resolved_version.string);
         },
         .default => {
-            var install_dir = try std.fs.openDirAbsolute(install_dir_path, .{ .iterate = true });
+            var install_dir = try std.fs.openDirAbsolute(install_dir_path.value, .{ .iterate = true });
             defer install_dir.close();
 
             if (argv.len == 1) {
                 errdefer std.log.err("Failed to get as default compiler path.", .{});
 
-                std.log.info("zig symlink at: {s}", .{path_link});
+                std.log.info("zig symlink at: {s}", .{path_link.value});
 
-                const default_compiler_path = try getDefaultCompilerPath(allocator, path_link);
+                const default_compiler_path = try getDefaultCompilerPath(allocator, path_link.value);
                 defer if (default_compiler_path) |path| allocator.free(path);
 
                 try std.io.getStdOut().writer().print(
@@ -268,13 +326,13 @@ pub fn mainInner() !void {
             } else {
                 const version = argv[1];
 
-                try setDefault(allocator, install_dir, path_link, version);
+                try setDefault(allocator, install_dir, path_link.value, version);
             }
         },
         .none => {
             const version = argv[0];
 
-            var install_dir = try std.fs.openDirAbsolute(install_dir_path, .{ .iterate = true });
+            var install_dir = try std.fs.openDirAbsolute(install_dir_path.value, .{ .iterate = true });
             defer install_dir.close();
 
             var dir = install_dir.openDir(version, .{}) catch |err| switch (err) {
@@ -286,11 +344,10 @@ pub fn mainInner() !void {
                         allocator,
                         install_dir,
                         version,
-                        index_url,
+                        index_url.value,
                     );
-                    defer resolved_version.deinit(allocator);
-
-                    try setDefault(allocator, install_dir, path_link, resolved_version.version);
+                    defer allocator.free(resolved_version.string);
+                    try setDefault(allocator, install_dir, path_link.value, resolved_version.string);
 
                     return; // TODO - not great?
                 },
@@ -299,7 +356,7 @@ pub fn mainInner() !void {
 
             std.log.info("version {s} already exists, setting as default", .{version});
 
-            try setDefault(allocator, install_dir, path_link, version);
+            try setDefault(allocator, install_dir, path_link.value, version);
         },
         .clean => {
             const clean_mode = if (argv.len == 2)
@@ -307,20 +364,16 @@ pub fn mainInner() !void {
             else
                 CleanMode.all;
 
-            var install_dir = try std.fs.openDirAbsolute(install_dir_path, .{ .iterate = true });
+            var install_dir = try std.fs.openDirAbsolute(install_dir_path.value, .{ .iterate = true });
             defer install_dir.close();
 
-            try cleanCompilers(allocator, install_dir, clean_mode, path_link);
+            try cleanCompilers(allocator, install_dir, clean_mode, path_link.value);
         },
     }
 }
 
 const ResolvedVersion = struct {
-    allocated: bool,
-    version: []const u8,
-    fn deinit(self: ResolvedVersion, allocator: std.mem.Allocator) void {
-        if (self.allocated) allocator.free(self.version);
-    }
+    string: []const u8,
 };
 
 fn installVersion(allocator: std.mem.Allocator, install_dir: std.fs.Dir, version: []const u8, index_url: []const u8) !ResolvedVersion {
@@ -333,7 +386,7 @@ fn installVersion(allocator: std.mem.Allocator, install_dir: std.fs.Dir, version
     const version_dir = makeNewVersionDir(install_dir, version_url.version) catch |err| switch (err) {
         error.PathAlreadyExists => {
             std.log.info("found version: {s}, which is already installed", .{version_url.version});
-            return ResolvedVersion{ .allocated = true, .version = version_url.version };
+            return ResolvedVersion{ .string = version_url.version };
         },
         else => return err,
     };
@@ -344,7 +397,7 @@ fn installVersion(allocator: std.mem.Allocator, install_dir: std.fs.Dir, version
 
     try installFromURL(allocator, version_url.url, version_dir);
 
-    return ResolvedVersion{ .allocated = true, .version = version_url.version };
+    return ResolvedVersion{ .string = version_url.version };
 }
 
 /// fails if version does not exist
@@ -392,6 +445,9 @@ fn setDefault(
                 install_dir.fd,
                 "zig",
             );
+        },
+        .windows => {
+            @panic("unimplemented");
         },
     }
 }
@@ -722,17 +778,21 @@ pub fn runCompiler(
 fn existsAbsolute(absolutePath: []const u8) !bool {
     std.fs.cwd().access(absolutePath, .{}) catch |e| switch (e) {
         error.FileNotFound => return false,
-        error.PermissionDenied => return e,
-        error.InputOutput => return e,
-        error.SystemResources => return e,
-        error.SymLinkLoop => return e,
-        error.FileBusy => return e,
-        error.Unexpected => unreachable,
-        error.InvalidUtf8 => return e,
-        error.InvalidWtf8 => return e,
-        error.ReadOnlyFileSystem => unreachable,
-        error.NameTooLong => unreachable,
-        error.BadPathName => unreachable,
+
+        error.PermissionDenied,
+        error.InputOutput,
+        error.SystemResources,
+        error.SymLinkLoop,
+        error.FileBusy,
+        error.InvalidUtf8,
+        error.InvalidWtf8,
+        => return e,
+
+        error.ReadOnlyFileSystem,
+        error.NameTooLong,
+        error.BadPathName,
+        error.Unexpected,
+        => unreachable,
     };
     return true;
 }
